@@ -1,0 +1,421 @@
+\documentclass[UTF8,a4paper,11pt]{ctexart}
+
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{fancyvrb}
+
+\geometry{left=2.4cm,right=2.4cm,top=2.4cm,bottom=2.4cm}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue
+}
+\setlist[itemize]{leftmargin=2em}
+\setlist[enumerate]{leftmargin=2em}
+\DefineVerbatimEnvironment{code}{Verbatim}{fontsize=\small}
+
+\title{\textbf{EyeProtect 项目技术总述}\\\large 算法依据、工具调用与实现边界}
+\author{EyeProtect Project}
+\date{2026 年 7 月}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{项目定位}
+
+EyeProtect 是一个部署在 Android 平板端的护眼原型项目。当前版本已经完成：
+
+\begin{itemize}
+  \item 通过 Android 系统接口读取屏幕/App 使用时间；
+  \item 通过 CameraX 调用前置摄像头；
+  \item 通过 Google ML Kit Face Detection 检测人脸和左右眼位置；
+  \item 绘制左右眼关键点、眼部边界框，并输出眼部坐标；
+  \item 计算 FPS、检测耗时、人脸框、眼部中心点；
+  \item 裁剪并显示左右眼 ROI；
+  \item 在后台、锁屏、横竖屏场景下管理摄像头资源。
+\end{itemize}
+
+当前项目的眼部识别目标是“眼部位置检测”，不是虹膜检测、眼球方向判断或屏幕注视点预测。
+
+\section{总体技术架构}
+
+项目由 Android 原生能力、CameraX 视频采集、ML Kit 人脸检测和自定义规则算法组成。
+
+\begin{code}
+Android UsageStatsManager
+  -> 屏幕/App 使用时间
+
+CameraX Preview
+  -> 前置摄像头实时预览
+
+CameraX ImageAnalysis
+  -> 实时读取视频帧
+  -> InputImage
+  -> Google ML Kit Face Detection
+  -> Face / FaceContour / FaceLandmark
+  -> 左右眼点位
+  -> 边界框、中心点、平滑、ROI 裁剪
+  -> Overlay 绘制与 Logcat 输出
+\end{code}
+
+\section{功能与依据}
+
+\subsection{屏幕使用时间统计}
+
+屏幕使用时间统计基于 Android 平台 API：\texttt{UsageStatsManager}。
+
+实现依据：
+
+\begin{itemize}
+  \item Android 系统会记录应用进入前台的使用情况；
+  \item 应用获得“使用情况访问权限”后，可以查询一段时间内的应用使用统计；
+  \item 项目使用 \texttt{queryUsageStats} 查询今日统计，并读取 \texttt{totalTimeInForeground} 作为使用时长。
+\end{itemize}
+
+当前代码位置：
+
+\begin{itemize}
+  \item \texttt{app/src/main/java/com/example/eyeprotect/usage/UsageAccessHelper.kt}
+  \item \texttt{app/src/main/java/com/example/eyeprotect/usage/ScreenUsageRepository.kt}
+\end{itemize}
+
+算法流程：
+
+\begin{code}
+检查 Usage Access 权限
+  -> 未授权：跳转系统设置页
+  -> 已授权：UsageStatsManager.queryUsageStats(...)
+  -> 按 packageName 聚合 totalTimeInForeground
+  -> 按使用时长倒序展示
+\end{code}
+
+这部分不是视觉算法，也不是后台录屏；它是系统级使用统计读取。
+
+\subsection{前置摄像头调用}
+
+前置摄像头调用基于 AndroidX CameraX。CameraX 是 Android Jetpack 中的相机库，用于简化不同 Android 设备上的相机兼容性处理。
+
+项目中使用两个 CameraX use case：
+
+\begin{itemize}
+  \item \texttt{Preview}：负责把摄像头画面显示到界面；
+  \item \texttt{ImageAnalysis}：负责实时读取帧，送入眼部检测链路。
+\end{itemize}
+
+关键实现：
+
+\begin{code}
+CameraSelector.DEFAULT_FRONT_CAMERA
+ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST
+ImageAnalysis.Builder().setTargetResolution(Size(640, 480))
+\end{code}
+
+当前代码位置：
+
+\begin{itemize}
+  \item \texttt{app/src/main/java/com/example/eyeprotect/camera/FrontCameraController.kt}
+\end{itemize}
+
+选择 \texttt{STRATEGY\_KEEP\_ONLY\_LATEST} 的原因是实时检测更重视低延迟，不需要处理积压旧帧。
+
+\subsection{人脸与眼部识别}
+
+眼部识别当前基于 Google ML Kit Face Detection SDK。
+
+项目中使用的依赖：
+
+\begin{code}
+implementation("com.google.mlkit:face-detection:16.1.7")
+\end{code}
+
+需要特别说明：当前 Android 版本不是使用 Python/OpenCV/MediaPipe 实现的。Python 版本曾作为 PC 端验证方案存在，但平板端实际运行的是 CameraX + ML Kit。
+
+ML Kit Face Detection 在项目中的作用：
+
+\begin{itemize}
+  \item 检测单帧图像中的人脸；
+  \item 输出人脸框；
+  \item 输出左右眼 landmark；
+  \item 输出左右眼 contour，即眼部轮廓点。
+\end{itemize}
+
+关键配置：
+
+\begin{code}
+FaceDetectorOptions.Builder()
+  .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+  .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
+  .setContourMode(FaceDetectorOptions.CONTOUR_MODE_ALL)
+  .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
+  .enableTracking()
+  .build()
+\end{code}
+
+当前代码位置：
+
+\begin{itemize}
+  \item \texttt{app/src/main/java/com/example/eyeprotect/vision/EyePositionAnalyzer.kt}
+\end{itemize}
+
+\subsection{眼部点位提取}
+
+ML Kit 返回 \texttt{Face} 对象后，项目优先读取：
+
+\begin{code}
+FaceContour.LEFT_EYE
+FaceContour.RIGHT_EYE
+\end{code}
+
+如果 contour 不可用，则使用：
+
+\begin{code}
+FaceLandmark.LEFT_EYE
+FaceLandmark.RIGHT_EYE
+\end{code}
+
+并基于中心点生成一个近似眼框。
+
+算法逻辑：
+
+\begin{code}
+Face
+  -> getContour(LEFT_EYE).points
+  -> getContour(RIGHT_EYE).points
+  -> 如果轮廓点为空，回退到 getLandmark(...)
+\end{code}
+
+\subsection{眼部边界框计算}
+
+眼部边界框不是 ML Kit 直接给出的眼框，而是项目根据眼部点位计算出来的。
+
+设眼部点集为：
+
+\begin{code}
+P = [(x1, y1), (x2, y2), ..., (xn, yn)]
+\end{code}
+
+边界框计算：
+
+\begin{code}
+box.x1 = min(x) - padding
+box.y1 = min(y) - padding
+box.x2 = max(x) + padding
+box.y2 = max(y) + padding
+\end{code}
+
+之后裁剪到图像范围：
+
+\begin{code}
+x1 >= 0
+y1 >= 0
+x2 <= imageWidth - 1
+y2 <= imageHeight - 1
+\end{code}
+
+当前代码位置：
+
+\begin{itemize}
+  \item \texttt{EyePositionAnalyzer.calculateBoundingBox(...)}
+  \item \texttt{app/src/main/java/com/example/eyeprotect/vision/BoundingBox.kt}
+\end{itemize}
+
+\subsection{眼部中心点}
+
+眼部中心点基于边界框计算：
+
+\begin{code}
+centerX = (box.x1 + box.x2) / 2
+centerY = (box.y1 + box.y2) / 2
+\end{code}
+
+注意：当前中心点表示“眼部框中心”，不是虹膜中心，也不是视线落点。
+
+\subsection{坐标平滑}
+
+实时检测中的眼部点会轻微抖动。项目使用指数平滑降低视觉抖动。
+
+公式：
+
+\begin{code}
+smoothed = previous + alpha * (current - previous)
+\end{code}
+
+当前 \texttt{alpha} 设置为 0.35。该值越大，响应越快但抖动越明显；该值越小，画面更稳但跟随延迟更高。
+
+当前代码位置：
+
+\begin{itemize}
+  \item \texttt{EyePositionAnalyzer.smoothEye(...)}
+\end{itemize}
+
+\subsection{左右眼 ROI 裁剪}
+
+ROI 是 Region of Interest，即感兴趣区域。项目根据平滑后的眼部边界框，从当前帧图像中裁剪左右眼小图。
+
+流程：
+
+\begin{code}
+CameraX ImageProxy
+  -> YUV_420_888
+  -> NV21
+  -> JPEG
+  -> Bitmap
+  -> 按旋转角度修正
+  -> 根据 eyeBox 扩大 1.8 倍
+  -> Bitmap.createBitmap(...)
+\end{code}
+
+当前代码位置：
+
+\begin{itemize}
+  \item \texttt{app/src/main/java/com/example/eyeprotect/vision/ImageProxyBitmapConverter.kt}
+  \item \texttt{EyePositionAnalyzer.cropEyeRoi(...)}
+\end{itemize}
+
+ROI 当前只用于显示和后续算法准备；尚未用于虹膜识别或眼球方向判断。
+
+\section{使用的工具、SDK 与开源边界}
+
+\begin{longtable}{|p{3.2cm}|p{3.4cm}|p{5.1cm}|p{3.2cm}|}
+\hline
+\textbf{组件} & \textbf{用途} & \textbf{项目中的调用方式} & \textbf{开源/开放边界} \\
+\hline
+Android Platform API & 系统使用统计、权限、生命周期 & \texttt{UsageStatsManager}、\texttt{AppOpsManager}、\texttt{BroadcastReceiver} & Android 平台 API，AOSP 中有大量平台代码；设备实现可能由厂商定制。 \\
+\hline
+AndroidX CameraX & 前置摄像头预览与帧分析 & \texttt{Preview}、\texttt{ImageAnalysis}、\texttt{CameraSelector.DEFAULT\_FRONT\_CAMERA} & AndroidX/Jetpack 开源库。 \\
+\hline
+Google ML Kit Face Detection & 人脸、眼部 landmark/contour 检测 & \texttt{FaceDetection.getClient(...)}、\texttt{FaceContour.LEFT\_EYE}、\texttt{FaceContour.RIGHT\_EYE} & 公开 SDK；底层模型不是本项目可修改的开源模型。 \\
+\hline
+Kotlin + Gradle & Android 应用开发与构建 & Kotlin 源码、Gradle Android Plugin、依赖管理 & Kotlin 与 Gradle 为开源工具链。 \\
+\hline
+自定义规则算法 & 边界框、中心点、平滑、ROI & \texttt{calculateBoundingBox}、\texttt{smoothEye}、\texttt{cropEyeRoi} & 项目自研规则代码，可完全修改。 \\
+\hline
+\end{longtable}
+
+\section{ML Kit 与 MediaPipe 的关系说明}
+
+项目早期曾实现过一个 PC 端 Python 版本：
+
+\begin{code}
+Python + OpenCV + MediaPipe Face Mesh
+\end{code}
+
+该版本用于验证眼部点位检测思路。但当前可安装到华为平板的 Android APK 没有运行 Python、OpenCV 或 MediaPipe Python 代码。
+
+当前 Android APK 的实际链路是：
+
+\begin{code}
+CameraX
+  -> ML Kit Face Detection
+  -> FaceContour.LEFT_EYE / RIGHT_EYE
+  -> 自定义边界框与 ROI 算法
+\end{code}
+
+因此，正式描述应写为：
+
+\begin{quote}
+本项目的 Android 端眼部位置识别基于 Google ML Kit Face Detection SDK。系统通过 CameraX 获取前置摄像头实时视频帧，将帧输入 ML Kit Face Detector，利用其输出的人脸框、左右眼轮廓点和眼部关键点，计算左右眼边界框、中心点和 ROI 区域。
+\end{quote}
+
+\section{当前输出数据}
+
+项目当前输出的核心数据包括：
+
+\begin{itemize}
+  \item \texttt{timestamp}：时间戳；
+  \item \texttt{face\_id}：人脸跟踪 ID；
+  \item \texttt{face\_count}：检测到的人脸数量；
+  \item \texttt{fps}：平滑后的帧率；
+  \item \texttt{latency\_ms}：单帧检测耗时；
+  \item \texttt{source\_width/source\_height}：分析帧尺寸；
+  \item \texttt{face\_box}：人脸框；
+  \item \texttt{left\_eye\_box/right\_eye\_box}：左右眼框；
+  \item \texttt{left\_eye\_center/right\_eye\_center}：左右眼中心点。
+\end{itemize}
+
+示例：
+
+\begin{code}
+{
+  "timestamp": 1783651200125,
+  "face_id": 0,
+  "face_count": 1,
+  "fps": 24.8,
+  "latency_ms": 37,
+  "source_width": 640,
+  "source_height": 480,
+  "face_box": {"x1": 180, "y1": 70, "x2": 460, "y2": 390},
+  "left_eye_box": {"x1": 245, "y1": 160, "x2": 305, "y2": 195},
+  "left_eye_center": {"x": 275, "y": 178},
+  "right_eye_box": {"x1": 340, "y1": 160, "x2": 400, "y2": 195},
+  "right_eye_center": {"x": 370, "y": 178}
+}
+\end{code}
+
+\section{资源与生命周期策略}
+
+摄像头是高占用资源，项目在工程层面实现了以下策略：
+
+\begin{itemize}
+  \item 应用进入后台时释放摄像头；
+  \item 应用回前台时，如果此前摄像头正在运行，则自动恢复；
+  \item 屏幕关闭或锁屏时停止摄像头，不自动恢复；
+  \item 用户可以点击 \texttt{Stop Camera} 手动释放摄像头；
+  \item 横竖屏切换时保存恢复意图，避免无谓丢失状态。
+\end{itemize}
+
+当前代码位置：
+
+\begin{itemize}
+  \item \texttt{MainActivity.onPause}
+  \item \texttt{MainActivity.onResume}
+  \item \texttt{MainActivity.ACTION\_SCREEN\_OFF BroadcastReceiver}
+  \item \texttt{FrontCameraController.stopPreview}
+\end{itemize}
+
+\section{当前限制}
+
+当前版本仍有明确边界：
+
+\begin{itemize}
+  \item 不能检测虹膜中心；
+  \item 不能判断眼球向左/向右/向上/向下；
+  \item 不能预测屏幕注视点；
+  \item 眼部中心点是眼框中心，不是瞳孔或虹膜中心；
+  \item ML Kit Face Detection 的底层模型不可在本项目内训练或修改；
+  \item 在弱光、遮挡、强侧脸、多人脸场景下检测稳定性会下降。
+\end{itemize}
+
+\section{后续扩展建议}
+
+建议下一步顺序：
+
+\begin{enumerate}
+  \item 睁闭眼检测：使用 ML Kit 的 \texttt{leftEyeOpenProbability/rightEyeOpenProbability}；
+  \item 眨眼事件检测：实现 \texttt{OPEN -> CLOSED -> OPEN} 状态机；
+  \item 疲劳提醒：结合闭眼时长、眨眼频率、屏幕使用时间；
+  \item 距离过近提醒：基于人脸框高度比例或双眼中心距离；
+  \item 虹膜与视线方向：评估 MediaPipe Face Landmarker / Iris 能力或独立模型；
+  \item 屏幕注视点预测：需要用户校准数据，不建议在无校准条件下直接实现。
+\end{enumerate}
+
+\section{参考资料}
+
+\begin{itemize}
+  \item Android \texttt{UsageStatsManager} 官方文档：\url{https://developer.android.com/reference/android/app/usage/UsageStatsManager}
+  \item Android CameraX 图像分析官方文档：\url{https://developer.android.com/media/camera/camerax/analyze}
+  \item AndroidX Camera 发布说明：\url{https://developer.android.com/jetpack/androidx/releases/camera}
+  \item Google ML Kit Face Detection Android 文档：\url{https://developers.google.com/ml-kit/vision/face-detection/android}
+  \item Google ML Kit Face Detection Concepts：\url{https://developers.google.com/ml-kit/vision/face-detection}
+  \item Kotlin 官方网站：\url{https://kotlinlang.org/}
+  \item Gradle 官方网站：\url{https://gradle.org/}
+\end{itemize}
+
+\end{document}

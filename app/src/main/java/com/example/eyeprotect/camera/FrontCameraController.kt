@@ -1,7 +1,6 @@
 package com.example.eyeprotect.camera
 
 import android.content.Context
-import android.util.Size
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
@@ -24,6 +23,7 @@ class FrontCameraController(
 
     fun startPreview(
         previewView: PreviewView,
+        analysisResolution: AnalysisResolution,
         onFrameResult: (EyeFrameResult) -> Unit,
         onReady: () -> Unit,
         onError: (Throwable) -> Unit
@@ -52,7 +52,7 @@ class FrontCameraController(
                         }
                     )
                     val imageAnalysis = ImageAnalysis.Builder()
-                        .setTargetResolution(Size(640, 480))
+                        .setTargetResolution(analysisResolution.size)
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                         .build()
                         .also {

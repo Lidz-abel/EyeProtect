@@ -1,7 +1,13 @@
 package com.example.eyeprotect
 
 import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.os.Bundle
 import android.util.Log
 import android.view.Gravity
@@ -16,10 +22,14 @@ import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
+import com.example.eyeprotect.camera.AnalysisResolution
 import com.example.eyeprotect.camera.FrontCameraController
 import com.example.eyeprotect.ui.EyeDetectionOverlay
 import com.example.eyeprotect.usage.ScreenUsageRepository
 import com.example.eyeprotect.usage.UsageAccessHelper
+import com.example.eyeprotect.vision.DistanceEstimate
+import com.example.eyeprotect.vision.DistanceState
+import com.example.eyeprotect.vision.EyeDistanceEstimator
 import com.example.eyeprotect.vision.EyeFrameResult
 import com.example.eyeprotect.vision.FaceEyeDetection
 import java.text.DateFormat
@@ -28,17 +38,50 @@ import java.util.Locale
 import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
+    companion object {
+        private const val KEY_RESUME_CAMERA = "resume_camera"
+        private const val PREFS_NAME = "eyeprotect_settings"
+        private const val PREF_CALIBRATED_EYE_DISTANCE_PX = "calibrated_eye_distance_px"
+        private const val PREF_ANALYSIS_RESOLUTION = "analysis_resolution"
+    }
+
     private lateinit var usageRepository: ScreenUsageRepository
     private lateinit var frontCameraController: FrontCameraController
+    private lateinit var distanceEstimator: EyeDistanceEstimator
+    private lateinit var settings: SharedPreferences
     private lateinit var statusText: TextView
     private lateinit var usageText: TextView
     private lateinit var eyeText: TextView
+    private lateinit var distanceText: TextView
     private lateinit var leftEyeRoiView: ImageView
     private lateinit var rightEyeRoiView: ImageView
     private lateinit var previewView: PreviewView
     private lateinit var eyeOverlay: EyeDetectionOverlay
     private lateinit var previewContainer: FrameLayout
+    private lateinit var startCameraButton: Button
+    private lateinit var stopCameraButton: Button
+    private lateinit var calibrateDistanceButton: Button
+    private lateinit var resolutionText: TextView
+    private lateinit var lowResolutionButton: Button
+    private lateinit var balancedResolutionButton: Button
+    private lateinit var highResolutionButton: Button
     private var lastEyeLogMillis = 0L
+    private var cameraRunning = false
+    private var resumeCameraOnForeground = false
+    private var screenReceiverRegistered = false
+    private var selectedAnalysisResolution = AnalysisResolution.BALANCED
+    private var latestFrameResult: EyeFrameResult? = null
+    private var latestFaceDetection: FaceEyeDetection? = null
+    private var latestDistanceEstimate: DistanceEstimate? = null
+
+    private val screenOffReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == Intent.ACTION_SCREEN_OFF) {
+                resumeCameraOnForeground = false
+                stopCamera("Screen is off. Camera stopped.", clearDetection = true)
+            }
+        }
+    }
 
     private val requestCameraPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -46,7 +89,9 @@ class MainActivity : ComponentActivity() {
         if (granted) {
             startFrontCamera()
         } else {
-            statusText.text = "Camera permission denied."
+            statusText.text = "Camera permission denied. Enable Camera permission in system settings."
+            eyeText.text = "Eye detection: camera permission is required."
+            updateCameraControls()
         }
     }
 
@@ -55,9 +100,27 @@ class MainActivity : ComponentActivity() {
 
         usageRepository = ScreenUsageRepository(this)
         frontCameraController = FrontCameraController(this, this)
+        settings = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        selectedAnalysisResolution = AnalysisResolution.fromKey(
+            settings.getString(PREF_ANALYSIS_RESOLUTION, AnalysisResolution.BALANCED.key)
+        )
+        distanceEstimator = EyeDistanceEstimator(
+            calibratedEyeDistancePx = if (settings.contains(PREF_CALIBRATED_EYE_DISTANCE_PX)) {
+                settings.getFloat(PREF_CALIBRATED_EYE_DISTANCE_PX, 0f)
+            } else {
+                null
+            }
+        )
+        resumeCameraOnForeground = savedInstanceState?.getBoolean(KEY_RESUME_CAMERA, false) == true
 
         setContentView(createContentView())
         refreshUsage()
+        updateCameraControls()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        registerScreenOffReceiver()
     }
 
     override fun onResume() {
@@ -65,20 +128,43 @@ class MainActivity : ComponentActivity() {
         if (::usageText.isInitialized) {
             refreshUsage()
         }
+        if (resumeCameraOnForeground && hasCameraPermission()) {
+            resumeCameraOnForeground = false
+            startFrontCamera()
+        }
+    }
+
+    override fun onPause() {
+        if (cameraRunning) {
+            resumeCameraOnForeground = true
+            stopCamera("App moved to background. Camera released.", clearDetection = true)
+        }
+        super.onPause()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean(KEY_RESUME_CAMERA, cameraRunning || resumeCameraOnForeground)
+        super.onSaveInstanceState(outState)
+    }
+
+    override fun onStop() {
+        unregisterScreenOffReceiver()
+        super.onStop()
     }
 
     override fun onDestroy() {
-        frontCameraController.stopPreview()
+        stopCamera("Camera stopped.", clearDetection = true)
         super.onDestroy()
     }
 
     private fun createContentView(): View {
         val density = resources.displayMetrics.density
         fun dp(value: Int): Int = (value * density).roundToInt()
+        val isLandscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(20), dp(20), dp(20))
+            setPadding(dp(20), dp(16), dp(20), dp(16))
             setBackgroundColor(ContextCompat.getColor(this@MainActivity, R.color.app_background))
         }
 
@@ -90,7 +176,7 @@ class MainActivity : ComponentActivity() {
         root.addView(statusText)
 
         val buttonRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
+            orientation = if (isLandscape) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dp(16), 0, dp(12))
         }
@@ -105,15 +191,56 @@ class MainActivity : ComponentActivity() {
             text = "Refresh Usage"
             setOnClickListener { refreshUsage() }
         }
-        val startCameraButton = Button(this).apply {
+        startCameraButton = Button(this).apply {
             text = "Start Front Camera"
             setOnClickListener { ensureCameraPermissionThenStart() }
+        }
+        stopCameraButton = Button(this).apply {
+            text = "Stop Camera"
+            setOnClickListener {
+                resumeCameraOnForeground = false
+                stopCamera("Camera stopped by user.", clearDetection = true)
+            }
+        }
+        calibrateDistanceButton = Button(this).apply {
+            text = "Calibrate 40cm"
+            setOnClickListener { calibrateDistanceAt40cm() }
         }
 
         buttonRow.addView(usageSettingsButton)
         buttonRow.addView(refreshUsageButton)
         buttonRow.addView(startCameraButton)
+        buttonRow.addView(stopCameraButton)
+        buttonRow.addView(calibrateDistanceButton)
         root.addView(buttonRow)
+
+        val resolutionRow = LinearLayout(this).apply {
+            orientation = if (isLandscape) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dp(12))
+        }
+        resolutionText = TextView(this).apply {
+            textSize = 14f
+            setTextColor(0xFF111827.toInt())
+            text = buildResolutionText()
+        }
+        lowResolutionButton = Button(this).apply {
+            text = "Low"
+            setOnClickListener { selectAnalysisResolution(AnalysisResolution.LOW_POWER) }
+        }
+        balancedResolutionButton = Button(this).apply {
+            text = "Balanced"
+            setOnClickListener { selectAnalysisResolution(AnalysisResolution.BALANCED) }
+        }
+        highResolutionButton = Button(this).apply {
+            text = "HD"
+            setOnClickListener { selectAnalysisResolution(AnalysisResolution.HIGH_QUALITY) }
+        }
+        resolutionRow.addView(resolutionText)
+        resolutionRow.addView(lowResolutionButton)
+        resolutionRow.addView(balancedResolutionButton)
+        resolutionRow.addView(highResolutionButton)
+        root.addView(resolutionRow)
 
         previewView = PreviewView(this).apply {
             implementationMode = PreviewView.ImplementationMode.COMPATIBLE
@@ -141,7 +268,7 @@ class MainActivity : ComponentActivity() {
             previewContainer,
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(320)
+                if (isLandscape) dp(280) else dp(360)
             )
         )
 
@@ -152,6 +279,14 @@ class MainActivity : ComponentActivity() {
             text = "Eye detection: not started."
         }
         root.addView(eyeText)
+
+        distanceText = TextView(this).apply {
+            textSize = 14f
+            setTextColor(0xFF111827.toInt())
+            setPadding(0, 0, 0, dp(8))
+            text = buildInitialDistanceText()
+        }
+        root.addView(distanceText)
 
         val roiRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -223,33 +358,160 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun ensureCameraPermissionThenStart() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
-            PackageManager.PERMISSION_GRANTED
-        ) {
+        if (hasCameraPermission()) {
             startFrontCamera()
         } else {
+            statusText.text = "Camera permission is required for eye detection."
             requestCameraPermission.launch(Manifest.permission.CAMERA)
         }
     }
 
     private fun startFrontCamera() {
+        if (cameraRunning) {
+            return
+        }
+        startCameraButton.isEnabled = false
+        stopCameraButton.isEnabled = false
+        statusText.text = "Starting front camera..."
         frontCameraController.startPreview(
             previewView = previewView,
+            analysisResolution = selectedAnalysisResolution,
             onFrameResult = { result ->
                 handleEyeFrameResult(result)
             },
             onReady = {
+                cameraRunning = true
+                updateCameraControls()
                 statusText.text = "Front camera and eye detection are running."
             },
             onError = { throwable ->
+                cameraRunning = false
+                resumeCameraOnForeground = false
+                updateCameraControls()
                 statusText.text = "Camera or eye detection failed: ${throwable.message}"
             }
         )
     }
 
+    private fun stopCamera(message: String, clearDetection: Boolean) {
+        frontCameraController.stopPreview()
+        cameraRunning = false
+        updateCameraControls()
+        if (::statusText.isInitialized) {
+            statusText.text = message
+        }
+        if (clearDetection && ::eyeText.isInitialized) {
+            clearDetectionUi(message)
+        }
+    }
+
+    private fun clearDetectionUi(message: String) {
+        if (::eyeOverlay.isInitialized) {
+            eyeOverlay.setDetections(
+                detections = emptyList(),
+                sourceWidth = previewView.width.coerceAtLeast(1),
+                sourceHeight = previewView.height.coerceAtLeast(1),
+                mirror = true
+            )
+        }
+        if (::leftEyeRoiView.isInitialized) {
+            leftEyeRoiView.setImageDrawable(null)
+        }
+        if (::rightEyeRoiView.isInitialized) {
+            rightEyeRoiView.setImageDrawable(null)
+        }
+        latestFrameResult = null
+        latestFaceDetection = null
+        latestDistanceEstimate = null
+        eyeText.text = "Eye detection: $message"
+        if (::distanceText.isInitialized) {
+            distanceText.text = buildInitialDistanceText()
+        }
+    }
+
+    private fun hasCameraPermission(): Boolean {
+        return ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+            PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun updateCameraControls() {
+        if (!::startCameraButton.isInitialized || !::stopCameraButton.isInitialized ||
+            !::calibrateDistanceButton.isInitialized
+        ) {
+            return
+        }
+        startCameraButton.isEnabled = !cameraRunning
+        stopCameraButton.isEnabled = cameraRunning
+        calibrateDistanceButton.isEnabled = cameraRunning
+        updateResolutionControls()
+    }
+
+    private fun updateResolutionControls() {
+        if (!::lowResolutionButton.isInitialized || !::balancedResolutionButton.isInitialized ||
+            !::highResolutionButton.isInitialized || !::resolutionText.isInitialized
+        ) {
+            return
+        }
+
+        resolutionText.text = buildResolutionText()
+        lowResolutionButton.isEnabled = selectedAnalysisResolution != AnalysisResolution.LOW_POWER
+        balancedResolutionButton.isEnabled = selectedAnalysisResolution != AnalysisResolution.BALANCED
+        highResolutionButton.isEnabled = selectedAnalysisResolution != AnalysisResolution.HIGH_QUALITY
+    }
+
+    private fun selectAnalysisResolution(resolution: AnalysisResolution) {
+        if (selectedAnalysisResolution == resolution) {
+            return
+        }
+
+        selectedAnalysisResolution = resolution
+        settings.edit()
+            .putString(PREF_ANALYSIS_RESOLUTION, resolution.key)
+            .apply()
+        updateResolutionControls()
+
+        if (cameraRunning) {
+            statusText.text = "Switching analysis resolution to ${resolution.label}..."
+            frontCameraController.stopPreview()
+            cameraRunning = false
+            clearDetectionUi("Resolution changed. Restarting camera...")
+            startFrontCamera()
+        } else {
+            statusText.text = "Analysis resolution set to ${resolution.label}."
+        }
+    }
+
+    private fun buildResolutionText(): String {
+        return "Analysis: ${selectedAnalysisResolution.label}"
+    }
+
+    private fun registerScreenOffReceiver() {
+        if (screenReceiverRegistered) {
+            return
+        }
+        ContextCompat.registerReceiver(
+            this,
+            screenOffReceiver,
+            IntentFilter(Intent.ACTION_SCREEN_OFF),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+        screenReceiverRegistered = true
+    }
+
+    private fun unregisterScreenOffReceiver() {
+        if (!screenReceiverRegistered) {
+            return
+        }
+        unregisterReceiver(screenOffReceiver)
+        screenReceiverRegistered = false
+    }
+
     private fun handleEyeFrameResult(result: EyeFrameResult) {
+        latestFrameResult = result
         val firstDetection = result.detections.firstOrNull()
         if (firstDetection == null) {
+            latestFaceDetection = null
+            latestDistanceEstimate = null
             eyeOverlay.setDetections(
                 detections = emptyList(),
                 sourceWidth = result.sourceWidth.coerceAtLeast(1),
@@ -264,8 +526,10 @@ class MainActivity : ComponentActivity() {
                 result.fps,
                 result.detectionLatencyMillis
             )
+            distanceText.text = "Distance: no face."
             return
         }
+        latestFaceDetection = firstDetection
 
         eyeOverlay.setDetections(
             detections = result.detections,
@@ -277,19 +541,67 @@ class MainActivity : ComponentActivity() {
         leftEyeRoiView.setImageBitmap(firstDetection.leftEye?.roiBitmap)
         rightEyeRoiView.setImageBitmap(firstDetection.rightEye?.roiBitmap)
 
-        val text = buildEyeCoordinateText(result, firstDetection)
+        val distanceEstimate = estimateDistance(result, firstDetection)
+        latestDistanceEstimate = distanceEstimate
+        distanceText.text = buildDistanceText(distanceEstimate)
+
+        val text = buildEyeCoordinateText(result, firstDetection, distanceEstimate)
         eyeText.text = text
 
         val now = System.currentTimeMillis()
         if (now - lastEyeLogMillis >= 500L) {
-            Log.d("EyeProtect", buildStructuredEyeResult(result, firstDetection))
+            Log.d("EyeProtect", buildStructuredEyeResult(result, firstDetection, distanceEstimate))
             lastEyeLogMillis = now
         }
     }
 
-    private fun buildEyeCoordinateText(
+    private fun estimateDistance(
         result: EyeFrameResult,
         detection: FaceEyeDetection
+    ): DistanceEstimate {
+        return distanceEstimator.estimate(
+            leftEyeCenter = detection.leftEye?.center,
+            rightEyeCenter = detection.rightEye?.center,
+            sourceWidth = result.sourceWidth,
+            faceCount = result.faceCount
+        )
+    }
+
+    private fun calibrateDistanceAt40cm() {
+        val detection = latestFaceDetection
+        if (detection == null) {
+            distanceText.text = "Distance: calibration failed. No face detected."
+            return
+        }
+
+        val eyeDistancePx = distanceEstimator.calculateEyeDistancePx(
+            leftEyeCenter = detection.leftEye?.center,
+            rightEyeCenter = detection.rightEye?.center
+        )
+        if (eyeDistancePx == null) {
+            distanceText.text = "Distance: calibration failed. Both eyes are required."
+            return
+        }
+
+        distanceEstimator.setCalibration(eyeDistancePx)
+        settings.edit()
+            .putFloat(PREF_CALIBRATED_EYE_DISTANCE_PX, eyeDistancePx)
+            .apply()
+
+        val result = latestFrameResult
+        val estimate = if (result != null) {
+            estimateDistance(result, detection)
+        } else {
+            latestDistanceEstimate
+        }
+        latestDistanceEstimate = estimate
+        distanceText.text = "Distance calibrated at 40cm. Eye distance=${eyeDistancePx.roundToInt()}px."
+    }
+
+    private fun buildEyeCoordinateText(
+        result: EyeFrameResult,
+        detection: FaceEyeDetection,
+        distanceEstimate: DistanceEstimate
     ): String {
         val leftEye = detection.leftEye
         val rightEye = detection.rightEye
@@ -309,11 +621,14 @@ class MainActivity : ComponentActivity() {
         val multiFace = if (result.faceCount > 1) "  MULTI_FACE=${result.faceCount}" else ""
         return String.format(
             Locale.US,
-            "Eye detection: face=%d%s  fps=%.1f  latency=%dms  faceBox=(%d,%d)-(%d,%d)\n%s\n%s",
+            "Eye detection: face=%d%s  fps=%.1f  latency=%dms  source=%dx%d  distance=%s  faceBox=(%d,%d)-(%d,%d)\n%s\n%s",
             detection.faceId,
             multiFace,
             result.fps,
             result.detectionLatencyMillis,
+            result.sourceWidth,
+            result.sourceHeight,
+            formatDistanceForInline(distanceEstimate),
             face.x1.roundToInt(),
             face.y1.roundToInt(),
             face.x2.roundToInt(),
@@ -325,7 +640,8 @@ class MainActivity : ComponentActivity() {
 
     private fun buildStructuredEyeResult(
         result: EyeFrameResult,
-        detection: FaceEyeDetection
+        detection: FaceEyeDetection,
+        distanceEstimate: DistanceEstimate
     ): String {
         val left = detection.leftEye
         val right = detection.rightEye
@@ -341,8 +657,56 @@ class MainActivity : ComponentActivity() {
             "\"left_eye_box\":${left?.box?.let { boxToJson(it) } ?: "null"}," +
             "\"left_eye_center\":${left?.center?.let { pointToJson(it.x, it.y) } ?: "null"}," +
             "\"right_eye_box\":${right?.box?.let { boxToJson(it) } ?: "null"}," +
-            "\"right_eye_center\":${right?.center?.let { pointToJson(it.x, it.y) } ?: "null"}" +
+            "\"right_eye_center\":${right?.center?.let { pointToJson(it.x, it.y) } ?: "null"}," +
+            "\"eye_distance_px\":${distanceEstimate.eyeDistancePx?.roundToInt() ?: "null"}," +
+            "\"estimated_distance_cm\":${distanceEstimate.estimatedDistanceCm?.roundToInt() ?: "null"}," +
+            "\"distance_state\":\"${distanceEstimate.state}\"," +
+            "\"distance_confidence\":${String.format(Locale.US, "%.2f", distanceEstimate.confidence)}," +
+            "\"distance_method\":\"${distanceEstimate.method}\"" +
             "}"
+    }
+
+    private fun buildInitialDistanceText(): String {
+        val calibration = if (::distanceEstimator.isInitialized) {
+            distanceEstimator.getCalibrationEyeDistancePx()
+        } else {
+            null
+        }
+        return if (calibration == null) {
+            "Distance: not calibrated. Hold the tablet about 40cm away and tap Calibrate 40cm."
+        } else {
+            "Distance: calibrated. Start camera to estimate eye-to-screen distance."
+        }
+    }
+
+    private fun buildDistanceText(estimate: DistanceEstimate): String {
+        val distance = estimate.estimatedDistanceCm?.let {
+            "${it.roundToInt()}cm"
+        } ?: "--"
+        val eyeDistance = estimate.eyeDistancePx?.let {
+            "${it.roundToInt()}px"
+        } ?: "--"
+        val stateText = when (estimate.state) {
+            DistanceState.NEEDS_CALIBRATION -> "NEEDS_CALIBRATION"
+            DistanceState.TOO_CLOSE -> "TOO_CLOSE"
+            DistanceState.NORMAL -> "NORMAL"
+            DistanceState.FAR -> "FAR"
+            DistanceState.UNKNOWN -> "UNKNOWN"
+        }
+        return String.format(
+            Locale.US,
+            "Distance: %s  state=%s  eyeDistance=%s  confidence=%.2f",
+            distance,
+            stateText,
+            eyeDistance,
+            estimate.confidence
+        )
+    }
+
+    private fun formatDistanceForInline(estimate: DistanceEstimate): String {
+        return estimate.estimatedDistanceCm?.let {
+            "${it.roundToInt()}cm/${estimate.state}"
+        } ?: estimate.state.toString()
     }
 
     private fun boxToJson(box: com.example.eyeprotect.vision.BoundingBox): String {
