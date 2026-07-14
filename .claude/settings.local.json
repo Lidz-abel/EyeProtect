@@ -54,7 +54,27 @@
       "Bash(MSYS2_ARG_CONV_EXCL=\"*\" \"C:/Users/Abel/AppData/Local/Android/Sdk/platform-tools/adb.exe\" shell \"dumpsys meminfo com.example.eyeprotect | grep ''''TOTAL PSS''''\")",
       "Bash(MSYS2_ARG_CONV_EXCL=\"*\" \"C:/Users/Abel/AppData/Local/Android/Sdk/platform-tools/adb.exe\" shell \"input keyevent KEYCODE_POWER\")",
       "Bash(MSYS2_ARG_CONV_EXCL=\"*\" \"C:/Users/Abel/AppData/Local/Android/Sdk/platform-tools/adb.exe\" shell \"pidof com.example.eyeprotect && dumpsys power | grep -i ''display\\\\|mWakefulness\\\\|mScreenOn''\")",
-      "Bash(\"D:/EyeProtect/scene_G_cpu.csv\")"
+      "Bash(\"D:/EyeProtect/scene_G_cpu.csv\")",
+      "Bash(MSYS2_ARG_CONV_EXCL=\"*\" \"C:/Users/Abel/AppData/Local/Android/Sdk/platform-tools/adb.exe\" devices)",
+      "Bash(./gradlew clean:*)",
+      "Bash(MSYS2_ARG_CONV_EXCL=\"*\" \"C:/Users/Abel/AppData/Local/Android/Sdk/platform-tools/adb.exe\" install -r \"D:/EyeProtect/app/build/outputs/apk/debug/app-debug.apk\")",
+      "Bash(MSYS2_ARG_CONV_EXCL=\"*\" \"C:/Users/Abel/AppData/Local/Android/Sdk/platform-tools/adb.exe\" push \"D:/EyeProtect/measurements/full_legacy_2026_07_13/cpu_sample.sh\" \"/data/local/tmp/cpu_sample.sh\")",
+      "Bash(MSYS2_ARG_CONV_EXCL=\"*\" \"C:/Users/Abel/AppData/Local/Android/Sdk/platform-tools/adb.exe\" shell \"chmod +x /data/local/tmp/cpu_sample.sh\")",
+      "Bash(MSYS2_ARG_CONV_EXCL=\"*\" \"C:/Users/Abel/AppData/Local/Android/Sdk/platform-tools/adb.exe\" shell \"getprop ro.product.manufacturer && getprop ro.product.model && getprop ro.build.version.release && getprop ro.board.platform && grep -c '^processor' /proc/cpuinfo && cat /proc/meminfo | grep MemTotal\")",
+      "Bash(\"D:/EyeProtect/measurements/lightweight_2026_07_14/L_A_idle_no_camera_cpu.csv\")",
+      "Read(//d/EyeProtect/{sum+=$4; count++} END{printf \"\"\"\"\"\"\"\"CPU avg=%.2f%%  samples=%d/n\"\"\"\"\"\"\"\", sum/**)",
+      "Bash(MSYS2_ARG_CONV_EXCL=\"*\" \"C:/Users/Abel/AppData/Local/Android/Sdk/platform-tools/adb.exe\" shell \"pidof com.example.eyeprotect && dumpsys meminfo com.example.eyeprotect | grep ''TOTAL PSS''\")",
+      "Bash(\"D:/EyeProtect/measurements/lightweight_2026_07_14/L_B_low_face_cpu.csv\")",
+      "Bash(\"D:/EyeProtect/measurements/lightweight_2026_07_14/L_B_low_face_logcat.txt\")",
+      "Bash(MSYS2_ARG_CONV_EXCL=\"*\" \"C:/Users/Abel/AppData/Local/Android/Sdk/platform-tools/adb.exe\" logcat -d -s EyeProtect:D)",
+      "Bash(MSYS2_ARG_CONV_EXCL=\"*\" \"C:/Users/Abel/AppData/Local/Android/Sdk/platform-tools/adb.exe\" shell \"cat /proc/stat > /dev/null; sleep 1; dumpsys meminfo com.example.eyeprotect | grep ''''TOTAL PSS''''\")",
+      "Bash(\"D:/EyeProtect/measurements/lightweight_2026_07_14/L_C_balanced_face_cpu.csv\")",
+      "Bash(MSYS2_ARG_CONV_EXCL=\"*\" \"C:/Users/Abel/AppData/Local/Android/Sdk/platform-tools/adb.exe\" logcat -d -v time -s EyeProtect:D)",
+      "Bash(\"D:/EyeProtect/measurements/lightweight_2026_07_14/L_C_balanced_face_logcat.txt\")",
+      "Read(//d/EyeProtect/{sum+=$4; count++; if\\(min==\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\\){min=max=$4}; if\\($4<min\\)min=$4; if\\($4>max\\)max=$4} END{printf \"\"\"\"\"\"\"\"avg=%.2f%%  min=%.2f%%  max=%.2f%%  samples=%d/n\"\"\"\"\"\"\"\", sum/**)",
+      "Bash(\"D:/EyeProtect/measurements/lightweight_2026_07_14/L_E_balanced_no_face_cpu.csv\")",
+      "Bash(\"D:/EyeProtect/measurements/lightweight_2026_07_14/L_F_background_cpu.csv\")",
+      "Bash(\"D:/EyeProtect/measurements/lightweight_2026_07_14/L_G_locked_cpu.csv\")"
     ]
   }
 }
