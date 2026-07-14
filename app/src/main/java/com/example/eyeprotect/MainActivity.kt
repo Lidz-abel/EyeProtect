@@ -14,7 +14,6 @@ import android.view.Gravity
 import android.view.View
 import android.widget.Button
 import android.widget.FrameLayout
-import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -53,8 +52,6 @@ class MainActivity : ComponentActivity() {
     private lateinit var usageText: TextView
     private lateinit var eyeText: TextView
     private lateinit var distanceText: TextView
-    private lateinit var leftEyeRoiView: ImageView
-    private lateinit var rightEyeRoiView: ImageView
     private lateinit var previewView: PreviewView
     private lateinit var eyeOverlay: EyeDetectionOverlay
     private lateinit var previewContainer: FrameLayout
@@ -288,26 +285,6 @@ class MainActivity : ComponentActivity() {
         }
         root.addView(distanceText)
 
-        val roiRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(0, 0, 0, dp(10))
-        }
-        leftEyeRoiView = createRoiImageView()
-        rightEyeRoiView = createRoiImageView()
-        roiRow.addView(
-            leftEyeRoiView,
-            LinearLayout.LayoutParams(0, dp(96), 1f).apply {
-                marginEnd = dp(6)
-            }
-        )
-        roiRow.addView(
-            rightEyeRoiView,
-            LinearLayout.LayoutParams(0, dp(96), 1f).apply {
-                marginStart = dp(6)
-            }
-        )
-        root.addView(roiRow)
-
         usageText = TextView(this).apply {
             textSize = 15f
             setTextColor(0xFF1F2937.toInt())
@@ -327,13 +304,6 @@ class MainActivity : ComponentActivity() {
         )
 
         return root
-    }
-
-    private fun createRoiImageView(): ImageView {
-        return ImageView(this).apply {
-            setBackgroundColor(0xFF0F172A.toInt())
-            scaleType = ImageView.ScaleType.CENTER_CROP
-        }
     }
 
     private fun refreshUsage() {
@@ -413,12 +383,6 @@ class MainActivity : ComponentActivity() {
                 sourceHeight = previewView.height.coerceAtLeast(1),
                 mirror = true
             )
-        }
-        if (::leftEyeRoiView.isInitialized) {
-            leftEyeRoiView.setImageDrawable(null)
-        }
-        if (::rightEyeRoiView.isInitialized) {
-            rightEyeRoiView.setImageDrawable(null)
         }
         latestFrameResult = null
         latestFaceDetection = null
@@ -518,8 +482,6 @@ class MainActivity : ComponentActivity() {
                 sourceHeight = result.sourceHeight.coerceAtLeast(1),
                 mirror = true
             )
-            leftEyeRoiView.setImageDrawable(null)
-            rightEyeRoiView.setImageDrawable(null)
             eyeText.text = String.format(
                 Locale.US,
                 "Eye detection: NO FACE  fps=%.1f  latency=%dms",
@@ -537,9 +499,6 @@ class MainActivity : ComponentActivity() {
             sourceHeight = result.sourceHeight,
             mirror = true
         )
-
-        leftEyeRoiView.setImageBitmap(firstDetection.leftEye?.roiBitmap)
-        rightEyeRoiView.setImageBitmap(firstDetection.rightEye?.roiBitmap)
 
         val distanceEstimate = estimateDistance(result, firstDetection)
         latestDistanceEstimate = distanceEstimate
@@ -606,16 +565,12 @@ class MainActivity : ComponentActivity() {
         val leftEye = detection.leftEye
         val rightEye = detection.rightEye
         val left = leftEye?.let {
-            val box = it.box
             val center = it.center
-            "L box=(${box.x1.roundToInt()},${box.y1.roundToInt()})-(${box.x2.roundToInt()},${box.y2.roundToInt()}) " +
-                "center=(${center.x.roundToInt()},${center.y.roundToInt()})"
+            "L center=(${center.x.roundToInt()},${center.y.roundToInt()})"
         } ?: "L unavailable"
         val right = rightEye?.let {
-            val box = it.box
             val center = it.center
-            "R box=(${box.x1.roundToInt()},${box.y1.roundToInt()})-(${box.x2.roundToInt()},${box.y2.roundToInt()}) " +
-                "center=(${center.x.roundToInt()},${center.y.roundToInt()})"
+            "R center=(${center.x.roundToInt()},${center.y.roundToInt()})"
         } ?: "R unavailable"
         val face = detection.faceBox
         val multiFace = if (result.faceCount > 1) "  MULTI_FACE=${result.faceCount}" else ""
@@ -654,9 +609,7 @@ class MainActivity : ComponentActivity() {
             "\"source_width\":${result.sourceWidth}," +
             "\"source_height\":${result.sourceHeight}," +
             "\"face_box\":${boxToJson(detection.faceBox)}," +
-            "\"left_eye_box\":${left?.box?.let { boxToJson(it) } ?: "null"}," +
             "\"left_eye_center\":${left?.center?.let { pointToJson(it.x, it.y) } ?: "null"}," +
-            "\"right_eye_box\":${right?.box?.let { boxToJson(it) } ?: "null"}," +
             "\"right_eye_center\":${right?.center?.let { pointToJson(it.x, it.y) } ?: "null"}," +
             "\"eye_distance_px\":${distanceEstimate.eyeDistancePx?.roundToInt() ?: "null"}," +
             "\"estimated_distance_cm\":${distanceEstimate.estimatedDistanceCm?.roundToInt() ?: "null"}," +

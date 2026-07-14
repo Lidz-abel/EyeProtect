@@ -1,6 +1,5 @@
 package com.example.eyeprotect.vision
 
-import android.graphics.Bitmap
 import android.graphics.PointF
 import android.graphics.Rect
 import androidx.annotation.OptIn
@@ -14,18 +13,17 @@ import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetector
 import com.google.mlkit.vision.face.FaceDetectorOptions
 import com.google.mlkit.vision.face.FaceLandmark
-import kotlin.math.roundToInt
 
 class EyePositionAnalyzer(
     private val onResult: (EyeFrameResult) -> Unit,
     private val onError: (Throwable) -> Unit
 ) : ImageAnalysis.Analyzer {
     private val detector: FaceDetector
-    private val previousEyes = mutableMapOf<String, PreviousEye>()
     @Volatile
     private var isProcessing = false
     private var previousFrameNanos = 0L
     private var smoothedFps = 0f
+    private var frameIndex = 0
 
     init {
         val options = FaceDetectorOptions.Builder()
@@ -41,6 +39,12 @@ class EyePositionAnalyzer(
 
     @OptIn(ExperimentalGetImage::class)
     override fun analyze(imageProxy: ImageProxy) {
+        frameIndex += 1
+        if (frameIndex % DETECTION_FRAME_INTERVAL != 0) {
+            imageProxy.close()
+            return
+        }
+
         if (isProcessing) {
             imageProxy.close()
             return
@@ -58,9 +62,6 @@ class EyePositionAnalyzer(
         val fps = updateFps(analyzeStartNanos)
         val rotationDegrees = imageProxy.imageInfo.rotationDegrees
         val inputImage = InputImage.fromMediaImage(mediaImage, rotationDegrees)
-        val frameBitmap = runCatching {
-            imageProxy.toRotatedBitmap(rotationDegrees)
-        }.getOrNull()
         val sourceWidth = if (rotationDegrees == 90 || rotationDegrees == 270) {
             imageProxy.height
         } else {
@@ -75,23 +76,19 @@ class EyePositionAnalyzer(
         detector.process(inputImage)
             .addOnSuccessListener { faces ->
                 val latencyMillis = ((System.nanoTime() - analyzeStartNanos) / 1_000_000L)
-                if (faces.isEmpty()) {
-                    previousEyes.clear()
-                }
 
                 onResult(
                     EyeFrameResult(
                         detections = faces.mapIndexed { index, face ->
-                        face.toEyeDetection(
-                            faceId = face.trackingId ?: index,
-                            sourceWidth = sourceWidth,
-                            sourceHeight = sourceHeight,
+                            face.toEyeDetection(
+                                faceId = face.trackingId ?: index,
+                                sourceWidth = sourceWidth,
+                                sourceHeight = sourceHeight,
                                 rotationDegrees = rotationDegrees,
                                 timestampMillis = timestampMillis,
                                 detectionLatencyMillis = latencyMillis,
-                                fps = fps,
-                                frameBitmap = frameBitmap
-                        )
+                                fps = fps
+                            )
                         },
                         sourceWidth = sourceWidth,
                         sourceHeight = sourceHeight,
@@ -137,8 +134,7 @@ class EyePositionAnalyzer(
         rotationDegrees: Int,
         timestampMillis: Long,
         detectionLatencyMillis: Long,
-        fps: Float,
-        frameBitmap: Bitmap?
+        fps: Float
     ): FaceEyeDetection {
         return FaceEyeDetection(
             faceId = faceId,
@@ -149,8 +145,7 @@ class EyePositionAnalyzer(
                 contourType = FaceContour.LEFT_EYE,
                 landmarkType = FaceLandmark.LEFT_EYE,
                 sourceWidth = sourceWidth,
-                sourceHeight = sourceHeight,
-                frameBitmap = frameBitmap
+                sourceHeight = sourceHeight
             ),
             rightEye = extractEye(
                 faceId = faceId,
@@ -158,8 +153,7 @@ class EyePositionAnalyzer(
                 contourType = FaceContour.RIGHT_EYE,
                 landmarkType = FaceLandmark.RIGHT_EYE,
                 sourceWidth = sourceWidth,
-                sourceHeight = sourceHeight,
-                frameBitmap = frameBitmap
+                sourceHeight = sourceHeight
             ),
             sourceWidth = sourceWidth,
             sourceHeight = sourceHeight,
@@ -176,8 +170,7 @@ class EyePositionAnalyzer(
         contourType: Int,
         landmarkType: Int,
         sourceWidth: Int,
-        sourceHeight: Int,
-        frameBitmap: Bitmap?
+        sourceHeight: Int
     ): EyeDetection? {
         val contourPoints = getContour(contourType)?.points.orEmpty()
         val points = if (contourPoints.isNotEmpty()) {
@@ -187,58 +180,17 @@ class EyePositionAnalyzer(
             fallbackEyePoints(center)
         }
 
-        val rawBox = calculateBoundingBox(
-            points = points,
-            padding = 8f,
-            sourceWidth = sourceWidth,
-            sourceHeight = sourceHeight
-        )
-        val smoothed = smoothEye(
-            key = "$faceId:$label",
-            points = points,
-            box = rawBox
-        )
-
+        val safePoints = points.map {
+            PointF(
+                it.x.coerceIn(0f, sourceWidth - 1f),
+                it.y.coerceIn(0f, sourceHeight - 1f)
+            )
+        }
         return EyeDetection(
             label = label,
-            points = smoothed.points,
-            box = smoothed.box,
-            center = PointF(smoothed.box.centerX, smoothed.box.centerY),
-            roiBitmap = cropEyeRoi(frameBitmap, smoothed.box)
+            points = safePoints,
+            center = calculateCenter(safePoints)
         )
-    }
-
-    private fun smoothEye(
-        key: String,
-        points: List<PointF>,
-        box: BoundingBox
-    ): PreviousEye {
-        val previous = previousEyes[key]
-        val alpha = 0.35f
-        val smoothedPoints = if (previous != null && previous.points.size == points.size) {
-            points.mapIndexed { index, point ->
-                val previousPoint = previous.points[index]
-                PointF(
-                    previousPoint.x + alpha * (point.x - previousPoint.x),
-                    previousPoint.y + alpha * (point.y - previousPoint.y)
-                )
-            }
-        } else {
-            points
-        }
-        val smoothedBox = if (previous != null) {
-            BoundingBox(
-                x1 = previous.box.x1 + alpha * (box.x1 - previous.box.x1),
-                y1 = previous.box.y1 + alpha * (box.y1 - previous.box.y1),
-                x2 = previous.box.x2 + alpha * (box.x2 - previous.box.x2),
-                y2 = previous.box.y2 + alpha * (box.y2 - previous.box.y2)
-            )
-        } else {
-            box
-        }
-        val smoothed = PreviousEye(smoothedPoints, smoothedBox)
-        previousEyes[key] = smoothed
-        return smoothed
     }
 
     private fun fallbackEyePoints(center: PointF): List<PointF> {
@@ -252,17 +204,14 @@ class EyePositionAnalyzer(
         )
     }
 
-    private fun calculateBoundingBox(
-        points: List<PointF>,
-        padding: Float,
-        sourceWidth: Int,
-        sourceHeight: Int
-    ): BoundingBox {
-        val x1 = (points.minOf { it.x } - padding).coerceAtLeast(0f)
-        val y1 = (points.minOf { it.y } - padding).coerceAtLeast(0f)
-        val x2 = (points.maxOf { it.x } + padding).coerceAtMost(sourceWidth - 1f)
-        val y2 = (points.maxOf { it.y } + padding).coerceAtMost(sourceHeight - 1f)
-        return BoundingBox(x1 = x1, y1 = y1, x2 = x2, y2 = y2)
+    private fun calculateCenter(points: List<PointF>): PointF {
+        if (points.isEmpty()) {
+            return PointF(0f, 0f)
+        }
+        return PointF(
+            points.sumOf { it.x.toDouble() }.toFloat() / points.size,
+            points.sumOf { it.y.toDouble() }.toFloat() / points.size
+        )
     }
 
     private fun Rect.toBoundingBox(sourceWidth: Int, sourceHeight: Int): BoundingBox {
@@ -274,30 +223,7 @@ class EyePositionAnalyzer(
         )
     }
 
-    private fun cropEyeRoi(frameBitmap: Bitmap?, box: BoundingBox): Bitmap? {
-        if (frameBitmap == null || box.width < 2f || box.height < 2f) {
-            return null
-        }
-
-        val scale = 1.8f
-        val cropWidth = box.width * scale
-        val cropHeight = box.height * scale
-        val left = (box.centerX - cropWidth / 2f).roundToInt().coerceAtLeast(0)
-        val top = (box.centerY - cropHeight / 2f).roundToInt().coerceAtLeast(0)
-        val right = (box.centerX + cropWidth / 2f).roundToInt().coerceAtMost(frameBitmap.width)
-        val bottom = (box.centerY + cropHeight / 2f).roundToInt().coerceAtMost(frameBitmap.height)
-
-        val width = right - left
-        val height = bottom - top
-        if (width < 2 || height < 2) {
-            return null
-        }
-
-        return Bitmap.createBitmap(frameBitmap, left, top, width, height)
+    companion object {
+        private const val DETECTION_FRAME_INTERVAL = 4
     }
-
-    private data class PreviousEye(
-        val points: List<PointF>,
-        val box: BoundingBox
-    )
 }
